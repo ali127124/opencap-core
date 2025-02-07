@@ -821,7 +821,7 @@ def synchronizeVideos(CameraDirectories, trialRelativePath, pathPoseDetector,
         key2D, confidence = loadPklVideo(
             ppPklPath, videoFullPath, imageBasedTracker=imageBasedTracker,
             poseDetector=poseDetector,confidenceThresholdForBB=0.3)
-        thisVideo = cv2.VideoCapture(videoFullPath[:-4] + '_rotated.avi')
+        thisVideo = cv2.VideoCapture(videoFullPath.replace('.mov', '_rotated.avi'))
         frameRate = np.round(thisVideo.get(cv2.CAP_PROP_FPS))        
         if key2D.shape[1] == 0 and confidence.shape[1] == 0:
             camsToExclude.append(camName)
@@ -932,9 +932,11 @@ def synchronizeVideoKeypoints(keypointList, confidenceList,
         if np.max(conf) == 0.0:
             badCameras.append(icam)
     idxBadCameras = [badCameras[i]-i for i in range(len(badCameras))]
+    cameras2NotUse = []
     for idxBadCamera in idxBadCameras:
         print('{} kicked out of synchronization'.format(
             c_cameras2Use[idxBadCamera]))
+        cameras2NotUse.append(c_cameras2Use[idxBadCamera])
         keypointList.pop(idxBadCamera)
         confidenceList.pop(idxBadCamera)
         c_CameraParams.pop(idxBadCamera)
@@ -1035,14 +1037,42 @@ def synchronizeVideoKeypoints(keypointList, confidenceList,
     allMarkerList = [p[:,idxStart:idxEnd] for p in allMarkerList]
     confSyncList= [c[:,idxStart:idxEnd] for c in confidenceList]
     
+    # We do this again, since it might have changed after finding the overlap period.
+    keypointList = list(keypointList)
+    confidenceList = list(confidenceList)
+    badCamerasOverlap = []
+    for icam, conf in enumerate(confSyncList):
+        if np.mean(conf) <= 0.01: # Looser than sum=0 to disregard very few frames with data
+            badCamerasOverlap.append(icam)
+    idxbadCamerasOverlap = [badCamerasOverlap[i]-i for i in range(len(badCamerasOverlap))]
+    for idxbadCameraOverlap in idxbadCamerasOverlap:
+        print('{} kicked out of synchronization - after overlap check'.format(
+            c_cameras2Use[idxbadCameraOverlap]))
+        cameras2NotUse.append(c_cameras2Use[idxbadCameraOverlap])
+        keypointList.pop(idxbadCameraOverlap)
+        confidenceList.pop(idxbadCameraOverlap)
+        c_CameraParams.pop(idxbadCameraOverlap)
+        c_cameras2Use.pop(idxbadCameraOverlap)
+        c_CameraDirectories.pop(idxbadCameraOverlap)
+        
+        vertVelList.pop(idxbadCameraOverlap)
+        mkrSpeedList.pop(idxbadCameraOverlap)
+        handPunchVertPositionList.pop(idxbadCameraOverlap)
+        allMarkerList.pop(idxbadCameraOverlap)
+        confSyncList.pop(idxbadCameraOverlap)        
+    nCams = len(keypointList)
+    
     # Detect whether it is a gait trial, which determines what sync algorithm
     # to use. Input right and left ankle marker speeds. Gait should be
     # detected for all cameras (all but one camera is > 2 cameras) for the
     # trial to be considered a gait trial.
+    try:
+        isGait = detectGaitAllVideos(mkrSpeedList,allMarkerList,confSyncList,markers4Ankles,sampleFreq)
+    except:
+        isGait = False
+        print('Detect gait activity algorithm failed.')
     
     # Detect activity, which determines sync function that gets used
-    isGait = detectGaitAllVideos(mkrSpeedList,allMarkerList,confSyncList,markers4Ankles,sampleFreq)
-    
     isHandPunch,handForPunch = detectHandPunchAllVideos(handPunchVertPositionList,sampleFreq)
     if isHandPunch:
         syncActivity = 'handPunch'
@@ -1098,7 +1128,9 @@ def synchronizeVideoKeypoints(keypointList, confidenceList,
                                  'confidence': confidenceSyncListFilt,
                                  'cameras2Use': c_cameras2Use
                                  }
-                corVal,lag = cross_corr(vertVel,vertVelList[0],multCorrGaussianStd=maxShiftSteps/2,visualize=False,dataForReproj=dataForReproj) # gaussian curve gets multipled by correlation plot - helping choose the smallest shift value for periodic motions
+                corVal,lag = cross_corr(vertVel,vertVelList[0],multCorrGaussianStd=maxShiftSteps/2,
+                                        visualize=False,dataForReproj=dataForReproj,
+                                        frameRate=sampleFreq) # gaussian curve gets multipled by correlation plot - helping choose the smallest shift value for periodic motions
             elif syncActivity == 'gait':
                 
                 dataForReproj = {'CamParamList':c_CameraParams,
@@ -1111,7 +1143,8 @@ def synchronizeVideoKeypoints(keypointList, confidenceList,
                                             mkrSpeedList[0],
                                             multCorrGaussianStd=maxShiftSteps/2,
                                             dataForReproj=dataForReproj,
-                                            visualize=False)     
+                                            visualize=False,
+                                            frameRate=sampleFreq)    
             elif syncActivity == 'handPunch':
                 corVal,lag = syncHandPunch([handPunchVertPositionList[i] for i in [0,iCam]],
                                            handForPunch,maxShiftSteps=maxShiftSteps)
@@ -1196,11 +1229,12 @@ def synchronizeVideoKeypoints(keypointList, confidenceList,
         
     # We need to add back the cameras that have been kicked out.
     # We just add back zeros, they will be kicked out of the triangulation.
-    for badCamera in badCameras:
-        keypointsSync.insert(badCamera, np.zeros(keypointsSync[0].shape))
-        confidenceSync.insert(badCamera, np.zeros(confidenceSync[0].shape))
-        nansInOutSync.insert(badCamera, np.array([np.nan, np.nan]))
-        startEndFrames.insert(badCamera, None)
+    idxCameras2NotUse = [cameras2Use.index(cam) for cam in cameras2NotUse]
+    for idxCamera2NotUse in idxCameras2NotUse:
+        keypointsSync.insert(idxCamera2NotUse, np.zeros(keypointsSync[0].shape))
+        confidenceSync.insert(idxCamera2NotUse, np.zeros(confidenceSync[0].shape))
+        nansInOutSync.insert(idxCamera2NotUse, np.array([np.nan, np.nan]))
+        startEndFrames.insert(idxCamera2NotUse, None)
  
     return keypointsSync, confidenceSync, nansInOutSync, startEndFrames
 
@@ -1477,13 +1511,20 @@ def findClosestBox(bbox,keyBoxes,imageSize,iPerson=None):
 def trackKeypointBox(videoPath,bbStart,allPeople,allBoxes,dataOut,frameStart = 0 ,
                      frameIncrement = 1, visualize = False, poseDetector='OpenPose',
                      badFramesBeforeStop = 0):
+    
+    # Extract camera name
+    if videoPath.split('InputMedia')[0][-5:-2] == 'Cam': # <= 10 cams
+        camName = videoPath.split('InputMedia')[0][-5:-1]
+    else:
+        camName = videoPath.split('InputMedia')[0][-6:-1]
+
     # Tracks closest keypoint bounding boxes until the box changes too much.
     bboxKey = bbStart # starting bounding box
     frameNum = frameStart
 
     # initiate video capture
     # Read video
-    video = cv2.VideoCapture(videoPath)
+    video = cv2.VideoCapture(videoPath.replace('.mov', '_rotated.avi'))
     nFrames = allBoxes[0].shape[0]
     
     # Read desiredFrames.
@@ -1491,7 +1532,7 @@ def trackKeypointBox(videoPath,bbStart,allPeople,allBoxes,dataOut,frameStart = 0
     ok, frame = video.read()
     if not ok:
         print('Cannot read video file')
-        sys.exit()
+        raise Exception('Cannot read video file')
         
     imageSize = (frame.shape[0],frame.shape[1])
     justStarted = True
@@ -1520,7 +1561,7 @@ def trackKeypointBox(videoPath,bbStart,allPeople,allBoxes,dataOut,frameStart = 0
             
         if not samePerson and not justStarted:
             if len(badFrames) >= badFramesBeforeStop:
-                print('not same person at ' + str(frameNum - frameIncrement*badFramesBeforeStop))
+                print('{}: not same person at {}'.format(camName, frameNum - frameIncrement*badFramesBeforeStop))
                 # Replace the data from the badFrames with zeros
                 if len(badFrames) > 1:
                     dataOut[badFrames,:] = np.zeros(len(badFrames),dataOut.shape[0])
@@ -1569,15 +1610,14 @@ def trackBoundingBox(videoPath,bbStart,allPeople,allBoxes,dataOut,frameStart = 0
     frameNum = frameStart
     
     # Read video
-    video = cv2.VideoCapture(videoPath)
+    video = cv2.VideoCapture(videoPath.replace('.mov', '_rotated.avi'))
     nFrames = allBoxes[0].shape[0]
 
     # Read desiredFrames.
     video.set(1, frameNum)
     ok, frame = video.read()
     if not ok:
-        print('Cannot read video file')
-        sys.exit()
+        raise Exception('Cannot read video file')
          
     # Initialize tracker with first frame and bounding box
     try:
@@ -2032,7 +2072,7 @@ def clean2Dkeypoints(key2D, confidence, confidenceThreshold=0.5, nCams=2,
     return key2D_out, confidence_out, nans_in_out, confidence_sync_out
 
 # %%
-def cross_corr(y1, y2,multCorrGaussianStd=None,visualize=False, dataForReproj=None):
+def cross_corr(y1, y2,multCorrGaussianStd=None,visualize=False, dataForReproj=None, frameRate=60):
     """Calculates the cross correlation and lags without normalization.
     
     The definition of the discrete cross-correlation is in:
@@ -2100,11 +2140,43 @@ def cross_corr(y1, y2,multCorrGaussianStd=None,visualize=False, dataForReproj=No
         reprojErrorRatio = reprojSort[0]/reprojSort[1]
         if reprojErrorRatio < 0.6 and not False in reprojSuccess: # tunable parameter. Usually around 0.25 for overground walking
             # find idx with minimum reprojection error 
-            lag = lags[np.argmin(reprojError)]
+            lag_corr = lags[np.argmin(reprojError)]
             max_corr = corr[lag+shift]
             
             if multCorrGaussianStd is not None:
                 print('For {}, used reprojection error minimization to sync.'.format(dataForReproj['cameras2Use'][dataForReproj['cams2UseReproj'][1]]))
+                 
+            # Refine with reprojection error minimization
+            # Calculate reprojection error with lags +/- .2 seconds around the selected lag. Select the lag with the lowest reprojection error.
+            # This helps the fact that correlation peak is not always the best lag, esp for front-facing cameras
+
+            # Create a list of lags to test that is +/- .2 seconds around the selected lag based on frameRate
+            numFrames = int(.2*frameRate)
+            lags = np.arange(lag_corr-numFrames,lag_corr+numFrames+1)
+            reprojErrors = np.empty((len(lags),1))
+
+            for iLag,lag in enumerate(lags):            
+                reprojErrors[iLag,0], _ = calcReprojectionErrorForSync(
+                    dataForReproj['CamParamList'], dataForReproj['keypointList'],
+                    lag, dataForReproj['cams2UseReproj'], 
+                    dataForReproj['confidence'], dataForReproj['cameras2Use'])
+                
+            # Select the lag with the lowest reprojection error
+            lag = lags[np.argmin(reprojErrors)]
+
+            # plot the reproj errors against lag and identify which was lag_corr
+            if visualize:
+                plt.figure()
+                plt.plot(lags,reprojErrors)
+                plt.plot(lag_corr,reprojErrors[list(lags).index(lag_corr)],marker='o',color='r')
+                plt.plot(lag,reprojErrors[list(lags).index(lag)],marker='o',color='k')
+                plt.xlabel('lag')
+                plt.ylabel('reprojection error')
+                plt.title('Reprojection error vs lag')
+                plt.legend(['reprojection error','corr lag','refined lag'])
+                plt.show()
+                
+                
             return max_corr, lag
         
     if visualize:
@@ -2128,7 +2200,7 @@ def cross_corr(y1, y2,multCorrGaussianStd=None,visualize=False, dataForReproj=No
 
 
 # %%
-def cross_corr_multiple_timeseries(Y1, Y2,multCorrGaussianStd=None,dataForReproj=None,visualize=False):
+def cross_corr_multiple_timeseries(Y1, Y2,multCorrGaussianStd=None,dataForReproj=None,visualize=False,frameRate=60):
     
     # SHAPE OF Y1,Y2 is nMkrs by nSamples
     """Calculates the cross correlation and lags without normalization.
@@ -2211,11 +2283,42 @@ def cross_corr_multiple_timeseries(Y1, Y2,multCorrGaussianStd=None,dataForReproj
         reprojErrorRatio = reprojSort[0]/reprojSort[1]
         if reprojErrorRatio < 0.6 and not False in reprojSuccess: # tunable parameter. Usually around 0.25 for overground walking
             # find idx with minimum reprojection error 
-            lag = lags[np.argmin(reprojError)]
+            lag_corr = lags[np.argmin(reprojError)]
             max_corr = summedCorr[lag+shift]
             
             if multCorrGaussianStd is not None:
                 print('For {}, used reprojection error minimization to sync.'.format(dataForReproj['cameras2Use'][dataForReproj['cams2UseReproj'][1]]))
+            
+            # Refine with reprojection error minimization
+            # Calculate reprojection error with lags +/- .2 seconds around the selected lag. Select the lag with the lowest reprojection error.
+            # This helps the fact that correlation peak is not always the best lag, esp for front-facing cameras
+
+            # Create a list of lags to test that is +/- .2 seconds around the selected lag based on frameRate
+            numFrames = int(.2*frameRate)
+            lags = np.arange(lag_corr-numFrames,lag_corr+numFrames+1)
+            reprojErrors = np.empty((len(lags),1))
+
+            for iLag,lag in enumerate(lags):            
+                reprojErrors[iLag,0], _ = calcReprojectionErrorForSync(
+                    dataForReproj['CamParamList'], dataForReproj['keypointList'],
+                    lag, dataForReproj['cams2UseReproj'], 
+                    dataForReproj['confidence'], dataForReproj['cameras2Use'])
+                
+            # Select the lag with the lowest reprojection error
+            lag = lags[np.argmin(reprojErrors)]
+
+            # plot the reproj errors against lag and identify which was lag_corr
+            if visualize:
+                plt.figure()
+                plt.plot(lags,reprojErrors)
+                plt.plot(lag_corr,reprojErrors[list(lags).index(lag_corr)],marker='o',color='r')
+                plt.plot(lag,reprojErrors[list(lags).index(lag)],marker='o',color='k')
+                plt.xlabel('lag')
+                plt.ylabel('reprojection error')
+                plt.title('Reprojection error vs lag')
+                plt.legend(['reprojection error','corr lag','refined lag'])
+                plt.show()
+
             return max_corr, lag
         
     # Multiply correlation curve by gaussian (prioritizing lag solution closest to 0)
@@ -2525,7 +2628,7 @@ def triangulateMultiviewVideo(CameraParamDict,keypointDict,imageScaleFactor=1,
             
             # get frame rate and assume all the same for sync'd videos
             if iCam==0: 
-                thisVideo = cv2.VideoCapture(inputPath)
+                thisVideo = cv2.VideoCapture(inputPath.replace('.mov', '_rotated.avi'))
                 frameRate = np.round(thisVideo.get(cv2.CAP_PROP_FPS))
                 thisVideo.release()
             

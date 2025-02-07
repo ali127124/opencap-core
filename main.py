@@ -13,6 +13,9 @@ import numpy as np
 import yaml
 import traceback
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 from utils import importMetadata, loadCameraParameters, getVideoExtension
 from utils import getDataDirectory, getOpenPoseDirectory, getMMposeDirectory
 from utilsChecker import saveCameraParameters
@@ -28,7 +31,7 @@ from utilsDetector  import runPoseDetector
 from utilsAugmenter import augmentTRC
 from utilsOpenSim import runScaleTool, getScaleTimeRange, runIKTool, generateVisualizerJson
 
-def main(sessionName, trialName, trial_id, camerasToUse=['all'],
+def main(sessionName, trialName, trial_id, cameras_to_use=['all'],
          intrinsicsFinalFolder='Deployed', isDocker=False,
          extrinsicsTrial=False, alternateExtrinsics=None, 
          calibrationOptions=None,
@@ -36,7 +39,10 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
          poseDetector='OpenPose', resolutionPoseDetection='default', 
          scaleModel=False, bbox_thr=0.8, augmenter_model='v0.3',
          genericFolderNames=False, offset=True, benchmark=False,
-         dataDir=None, overwriteAugmenterModel=False):
+         dataDir=None, overwriteAugmenterModel=False,
+         filter_frequency='default', overwriteFilterFrequency=False,
+         scaling_setup='upright_standing_pose', overwriteScalingSetup=False,
+         overwriteCamerasToUse=False):
 
     # %% High-level settings.
     # Camera calibration.
@@ -50,9 +56,7 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
     # Marker augmentation.
     runMarkerAugmentation = True
     # OpenSim pipeline.
-    runOpenSimPipeline = True
-    # Lowpass filter frequency of 2D keypoints for gait and everything else.
-    filtFreqs = {'gait':12, 'default':500} # defaults to framerate/2
+    runOpenSimPipeline = True    
     # High-resolution for OpenPose.
     resolutionPoseDetection = resolutionPoseDetection
     # Set to False to only generate the json files (default is True).
@@ -97,6 +101,35 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
         augmenterModel = sessionMetadata['augmentermodel']
     else:
         augmenterModel = augmenter_model
+        
+    # Lowpass filter frequency of 2D keypoints for gait and everything else.
+    # If overwriteFilterFrequency is True, the filter frequency is the one
+    # passed as an argument to main(). This is useful for local testing.
+    if 'filterfrequency' in sessionMetadata and not overwriteFilterFrequency:
+        filterfrequency = sessionMetadata['filterfrequency']
+    else:
+        filterfrequency = filter_frequency
+    if filterfrequency == 'default':
+        filtFreqs = {'gait':12, 'default':500} # defaults to framerate/2
+    else:
+        filtFreqs = {'gait':filterfrequency, 'default':filterfrequency}
+
+    # If scaling setup defined through web app.
+    # If overwriteScalingSetup is True, the scaling setup is the one
+    # passed as an argument to main(). This is useful for local testing.
+    if 'scalingsetup' in sessionMetadata and not overwriteScalingSetup:
+        scalingSetup = sessionMetadata['scalingsetup']
+    else:
+        scalingSetup = scaling_setup
+
+    # If camerastouse is in sessionMetadata, reprocess with specified cameras.
+    # This allows reprocessing trials with missing videos. If
+    # overwriteCamerasToUse is True, the camera selection is the one
+    # passed as an argument to main(). This is useful for local testing.
+    if 'camerastouse' in sessionMetadata and not overwriteCamerasToUse:
+        camerasToUse = sessionMetadata['camerastouse']
+    else:
+        camerasToUse = cameras_to_use
 
     # %% Paths to pose detector folder for local testing.
     if poseDetector == 'OpenPose':
@@ -141,7 +174,10 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
             'poseDetector': poseDetector, 
             'augmenter_model': augmenterModel, 
             'imageUpsampleFactor': imageUpsampleFactor,
-            'openSimModel': sessionMetadata['openSimModel']}
+            'openSimModel': sessionMetadata['openSimModel'],
+            'scalingSetup': scalingSetup,
+            'filterFrequency': filterfrequency,
+            }
         if poseDetector == 'OpenPose':
             settings['resolutionPoseDetection'] = resolutionPoseDetection
         elif poseDetector == 'mmpose':
@@ -180,7 +216,7 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
             # Intrinsics and extrinsics already exist for this session.
             if os.path.exists(
                     os.path.join(camDir,"cameraIntrinsicsExtrinsics.pickle")):
-                print("Load extrinsics for {} - already existing".format(
+                logging.info("Load extrinsics for {} - already existing".format(
                     camName))
                 CamParams = loadCameraParameters(
                     os.path.join(camDir, "cameraIntrinsicsExtrinsics.pickle"))
@@ -188,8 +224,7 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
                 
             # Extrinsics do not exist for this session.
             else:
-                print("Compute extrinsics for {} - not yet existing".format(
-                    camName))
+                logging.info("Compute extrinsics for {} - not yet existing".format(camName))
                 # Intrinsics ##################################################
                 # Intrinsics directories.
                 intrinsicDir = os.path.join(baseDir, 'CameraIntrinsics',
@@ -291,13 +326,59 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
         else:
             raise Exception('checkerBoard placement value in\
              sessionMetadata.yaml is not currently supported')
+             
+        # Detect all available cameras (ie, cameras with existing videos).
+        cameras_available = []
+        for camName in cameraDirectories:
+            camDir = cameraDirectories[camName]
+            pathVideoWithoutExtension = os.path.join(camDir, 'InputMedia', trialName, trial_id)
+            if len(glob.glob(pathVideoWithoutExtension + '*')) == 0:
+                print(f"Camera {camName} does not have a video for trial {trial_id}")
+            else:
+                if os.path.exists(os.path.join(pathVideoWithoutExtension + getVideoExtension(pathVideoWithoutExtension))):
+                    cameras_available.append(camName)
+                else:
+                    print(f"Camera {camName} does not have a video for trial {trial_id}")
+
+        if camerasToUse[0] == 'all':
+            cameras_all = list(cameraDirectories.keys())
+            if not all([cam in cameras_available for cam in cameras_all]):
+                exception = 'Not all cameras have uploaded videos; one or more cameras might have turned off or lost connection'
+                raise Exception(exception, exception)
+            else:
+                camerasToUse_c = camerasToUse
+        elif camerasToUse[0] == 'all_available':
+            camerasToUse_c = cameras_available
+            print(f"Using available cameras: {camerasToUse_c}")
+        else:
+            if not all([cam in cameras_available for cam in camerasToUse]):
+                raise Exception('Not all specified cameras in camerasToUse have videos; verify the camera names or consider setting camerasToUse to ["all_available"]')
+            else:
+                camerasToUse_c = camerasToUse
+                print(f"Using cameras: {camerasToUse_c}")
+        settings['camerasToUse'] = camerasToUse_c
+        if camerasToUse_c[0] != 'all' and len(camerasToUse_c) < 2:
+            exception = 'At least two videos are required for 3D reconstruction, video upload likely failed for one or more cameras.'
+            raise Exception(exception, exception)
+            
+        # For neutral, we do not allow reprocessing with not all cameras.
+        # The reason is that it affects extrinsics selection, and then you can only process
+        # dynamic trials with the same camera selection (ie, potentially not all cameras). 
+        # This might be addressable, but I (Antoine) do not see an immediate need + this
+        # would be a significant change in the code base. In practice, a data collection
+        # will not go through neutral if not all cameras are available.
+        if scaleModel:
+            if camerasToUse_c[0] != 'all' and len(camerasToUse_c) < len(cameraDirectories):
+                exception = 'All cameras are required for calibration and neutral pose.'
+                raise Exception(exception, exception)
+        
         # Run pose detection algorithm.
         try:        
             videoExtension = runPoseDetector(
                     cameraDirectories, trialRelativePath, poseDetectorDirectory,
                     trialName, CamParamDict=CamParamDict, 
                     resolutionPoseDetection=resolutionPoseDetection, 
-                    generateVideo=generateVideo, cams2Use=camerasToUse,
+                    generateVideo=generateVideo, cams2Use=camerasToUse_c,
                     poseDetector=poseDetector, bbox_thr=bbox_thr)
             trialRelativePath += videoExtension
         except Exception as e:
@@ -308,16 +389,16 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
                     Visit https://www.opencap.ai/best-pratices to learn more about data collection
                     and https://www.opencap.ai/troubleshooting for potential causes for a failed trial."""
                 raise Exception(exception, traceback.format_exc())
-        
+      
     if runSynchronization:
-        # Synchronize videos. 
+        # Synchronize videos.
         try:
             keypoints2D, confidence, keypointNames, frameRate, nansInOut, startEndFrames, cameras2Use = (
                 synchronizeVideos( 
                     cameraDirectories, trialRelativePath, poseDetectorDirectory,
                     undistortPoints=True, CamParamDict=CamParamDict,
                     filtFreqs=filtFreqs, confidenceThreshold=0.4,
-                    imageBasedTracker=False, cams2Use=camerasToUse, 
+                    imageBasedTracker=False, cams2Use=camerasToUse_c, 
                     poseDetector=poseDetector, trialName=trialName,
                     resolutionPoseDetection=resolutionPoseDetection))
         except Exception as e:
@@ -332,10 +413,18 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
                     potential causes for a failed trial."""
                 raise Exception(exception, traceback.format_exc())
                 
+    # Note: this should not be necessary, because we prevent reprocessing the neutral trial
+    # with not all cameras, but keeping it in there in case we would want to.
+    if calibrationOptions is not None:
+        allCams = list(calibrationOptions.keys())
+        for cam_t in allCams:
+            if not cam_t in cameras2Use:
+                calibrationOptions.pop(cam_t)
+                
     if scaleModel and calibrationOptions is not None and alternateExtrinsics is None:
         # Automatically select the camera calibration to use
         CamParamDict = autoSelectExtrinsicSolution(sessionDir,keypoints2D,confidence,calibrationOptions)
-         
+     
     if runTriangulation:
         # Triangulate.
         try:
@@ -385,7 +474,7 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
     if runMarkerAugmentation:
         os.makedirs(postAugmentationDir, exist_ok=True)    
         augmenterDir = os.path.join(baseDir, "MarkerAugmenter")
-        print('Augmenting marker set')
+        logging.info('Augmenting marker set')
         try:
             vertical_offset = augmentTRC(
                 pathOutputFiles[trialName],sessionMetadata['mass_kg'], 
@@ -430,8 +519,11 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
         if scaleModel:
             os.makedirs(outputScaledModelDir, exist_ok=True)
             # Path setup file.
-            genericSetupFile4ScalingName = (
-                'Setup_scaling_RajagopalModified2016_withArms_KA.xml')
+            if scalingSetup == 'any_pose':
+                genericSetupFile4ScalingName = 'Setup_scaling_LaiUhlrich2022_any_pose.xml'
+            else: # by default, use upright_standing_pose
+                genericSetupFile4ScalingName = 'Setup_scaling_LaiUhlrich2022.xml'
+
             pathGenericSetupFile4Scaling = os.path.join(
                 openSimPipelineDir, 'Scaling', genericSetupFile4ScalingName)
             # Path model file.
@@ -442,12 +534,23 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
             pathTRCFile4Scaling = pathAugmentedOutputFiles[trialName]
             # Get time range.
             try:
-                timeRange4Scaling = getScaleTimeRange(pathTRCFile4Scaling,
-                                                      thresholdPosition=0.007,
-                                                      thresholdTime=0.1,
-                                                      removeRoot=True)          
+                thresholdPosition = 0.003
+                maxThreshold = 0.015
+                increment = 0.001
+                success = False
+                while thresholdPosition <= maxThreshold and not success:
+                    try:
+                        timeRange4Scaling = getScaleTimeRange(
+                            pathTRCFile4Scaling,
+                            thresholdPosition=thresholdPosition,
+                            thresholdTime=0.1, removeRoot=True)
+                        success = True
+                    except Exception as e:
+                        logging.info(f"Attempt identifying scaling time range with thresholdPosition {thresholdPosition} failed: {e}")
+                        thresholdPosition += increment  # Increase the threshold for the next iteration
+
                 # Run scale tool.
-                print('Running Scaling')
+                logging.info('Running Scaling')
                 pathScaledModel = runScaleTool(
                     pathGenericSetupFile4Scaling, pathGenericModel4Scaling,
                     sessionMetadata['mass_kg'], pathTRCFile4Scaling, 
@@ -467,7 +570,8 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
             popNeutralPoseImages(cameraDirectories, cameras2Use, 
                                  timeRange4Scaling[0], staticImagesFolderDir,
                                  trial_id, writeVideo = True)   
-            pathOutputIK = pathScaledModel[:-5]+'.mot'     
+            pathOutputIK = pathScaledModel[:-5] + '.mot'
+            pathModelIK = pathScaledModel
         
         # Inverse kinematics.
         if not scaleModel:
@@ -485,9 +589,9 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
                 # Path TRC file.
                 pathTRCFile4IK = pathAugmentedOutputFiles[trialName]
                 # Run IK tool. 
-                print('Running Inverse Kinematics')
+                logging.info('Running Inverse Kinematics')
                 try:
-                    pathOutputIK = runIKTool(
+                    pathOutputIK, pathModelIK = runIKTool(
                         pathGenericSetupFile4IK, pathScaledModel, 
                         pathTRCFile4IK, outputIKDir)
                 except Exception as e:
@@ -505,12 +609,13 @@ def main(sessionName, trialName, trial_id, camerasToUse=['all'],
         os.makedirs(outputJsonVisDir,exist_ok=True)
         outputJsonVisPath = os.path.join(outputJsonVisDir,
                                          trialName + '.json')
-        generateVisualizerJson(pathScaledModel, pathOutputIK,
+        generateVisualizerJson(pathModelIK, pathOutputIK,
                                outputJsonVisPath, 
                                vertical_offset=vertical_offset)  
         
     # %% Rewrite settings, adding offset  
-    if not extrinsicsTrial and offset:
-        settings['verticalOffset'] = vertical_offset_settings 
+    if not extrinsicsTrial:
+        if offset:
+            settings['verticalOffset'] = vertical_offset_settings 
         with open(pathSettings, 'w') as file:
             yaml.dump(settings, file)

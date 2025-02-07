@@ -369,6 +369,8 @@ def getMetadataFromServer(session_id,justCheckerParams=False):
                 session_desc["subjectID"] = session['meta']['subject']['id']
                 session_desc["mass_kg"] = float(session['meta']['subject']['mass'])
                 session_desc["height_m"] = float(session['meta']['subject']['height'])
+                if 'gender' in session['meta']['subject']:
+                    session_desc["gender_mf"] = session['meta']['subject']['gender']
                 # Before implementing the subject feature, the posemodel was stored
                 # in session['meta']['subject']. After implementing the subject
                 # feature, the posemodel is stored in session['meta']['settings']
@@ -377,7 +379,7 @@ def getMetadataFromServer(session_id,justCheckerParams=False):
                     session_desc["posemodel"] = session['meta']['subject']['posemodel']
                 except:
                     session_desc["posemodel"] = 'openpose'
-                # This might happen if openSimModel/augmentermodel was changed post data collection.
+                # This might happen if openSimModel/augmentermodel/filterfrequency/scalingsetup was changed post data collection.
                 if 'settings' in session['meta']:
                     try:
                         session_desc["openSimModel"] = session['meta']['settings']['openSimModel']
@@ -387,11 +389,22 @@ def getMetadataFromServer(session_id,justCheckerParams=False):
                         session_desc["augmentermodel"] = session['meta']['settings']['augmentermodel']
                     except:
                         session_desc["augmentermodel"] = 'v0.2'
+                    try:
+                        session_desc["filterfrequency"] = session['meta']['settings']['filterfrequency']
+                        if session_desc["filterfrequency"] != 'default':
+                            session_desc["filterfrequency"] = float(session_desc["filterfrequency"])
+                    except:
+                        session_desc["filterfrequency"] = 'default'
+                    try:
+                        session_desc["scalingsetup"] = session['meta']['settings']['scalingsetup']
+                    except:
+                        session_desc["scalingsetup"] = 'upright_standing_pose'
             else:                
                 subject_info = getSubjectJson(session['subject'])                
                 session_desc["subjectID"] = subject_info['name']
                 session_desc["mass_kg"] = subject_info['weight']
                 session_desc["height_m"] = subject_info['height']
+                session_desc["gender_mf"] = subject_info['gender']
                 try:
                     session_desc["posemodel"] = session['meta']['settings']['posemodel']
                 except:
@@ -404,6 +417,16 @@ def getMetadataFromServer(session_id,justCheckerParams=False):
                     session_desc["augmentermodel"] = session['meta']['settings']['augmentermodel']
                 except:
                     session_desc["augmentermodel"] = 'v0.2'
+                try:
+                    session_desc["filterfrequency"] = session['meta']['settings']['filterfrequency']
+                    if session_desc["filterfrequency"] != 'default':
+                        session_desc["filterfrequency"] = float(session_desc["filterfrequency"])
+                except:
+                    session_desc["filterfrequency"] = 'default'
+                try:
+                    session_desc["scalingsetup"] = session['meta']['settings']['scalingsetup']
+                except:
+                    session_desc["scalingsetup"] = 'upright_standing_pose'
 
         if 'sessionWithCalibration' in session['meta'] and 'checkerboard' not in session['meta']:
             newSessionId = session['meta']['sessionWithCalibration']['id']
@@ -553,7 +576,7 @@ def downloadAndSwitchCalibrationFromDjango(session_id,session_path,calibTrialID 
        
     calibURLs = {t['device_id']:t['media'] for t in trial['results'] if t['tag'] == 'calibration_parameters_options'}
     
-    if 'meta' in trial.keys() and trial['meta'] is not None and 'calibration' in trial['meta'].keys():
+    if 'meta' in trial.keys() and trial['meta'] is not None and 'calibration' in trial['meta'].keys() and trial['meta']['calibration']:
         calibDict = trial['meta']['calibration']
     else:
         print('No metadata for camera switching. Using first solution.')
@@ -587,7 +610,20 @@ def downloadAndSwitchCalibrationFromDjango(session_id,session_path,calibTrialID 
     else:
         return None
     
-def changeSessionMetadata(session_ids,newMetaDict):   
+def changeSessionMetadata(session_ids,newMetaDict):
+
+    if 'filterfrequency' in newMetaDict and newMetaDict['filterfrequency'] != 'default':
+        if type(newMetaDict['filterfrequency']) is not str:
+            newMetaDict['filterfrequency'] = str(newMetaDict['filterfrequency'])
+        else:
+            raise Exception('Filter frequency should be a number or default.')
+        
+    if 'datasharing' in newMetaDict:
+        if newMetaDict['datasharing'] not in ['Share processed data and identified videos',
+                                                'Share processed data and de-identified videos',
+                                                'Share processed data',
+                                                'Share no data']:
+                raise Exception('datasharing is {} but should be one of the following options: "Share processed data and identified videos", "Share processed data and de-identified videos", "Share processed data", "Share no data".'.format(newMetaDict['datasharing']))
    
     for session_id in session_ids:
         session_url = "{}{}{}/".format(API_URL, "sessions/", session_id)
@@ -595,6 +631,18 @@ def changeSessionMetadata(session_ids,newMetaDict):
         # get metadata
         session = getSessionJson(session_id)
         existingMeta = session['meta']
+        
+        # Check if framerate is in metadata. If not, set to 60
+        if 'framerate' not in existingMeta:
+            framerate = 60
+        else:
+            framerate = existingMeta['framerate']
+        if 'filterfrequency' in newMetaDict:
+            if newMetaDict['filterfrequency'] != 'default':
+                if float(newMetaDict['filterfrequency']) > framerate/2:
+                    raise Exception('Filter frequency cannot exceed Nyquist frequency (here {}Hz).'.format(framerate/2))
+                elif float(newMetaDict['filterfrequency']) < 0:
+                    raise Exception('Filter frequency cannot be negative.')        
         
         # change metadata
         # Hack: wrong mapping between metadata and yaml
@@ -626,15 +674,15 @@ def changeSessionMetadata(session_ids,newMetaDict):
         for newMeta in newMetaDict:
             if not newMeta in addedKey:
                 print("Could not find {} in existing metadata, trying to add it.".format(newMeta))
-                settings_fields = ['framerate', 'posemodel', 'openSimModel', 'augmentermodel']
+                settings_fields = ['framerate', 'posemodel', 'openSimModel', 'augmentermodel', 'filterfrequency', 'scalingsetup', 'camerastouse']
                 if newMeta in settings_fields:
                     if 'settings' not in existingMeta:
                         existingMeta['settings'] = {}
                     existingMeta['settings'][newMeta] = newMetaDict[newMeta]
                     addedKey[newMeta] = newMetaDict[newMeta]
-                    print("Added {} to settings in metadata".format(newMetaDict[newMeta]))
+                    print("Added {}={} to settings in metadata".format(newMeta, newMetaDict[newMeta]))
                 else:
-                    print("Could not add {} to the metadata; not recognized".format(newMetaDict[newMeta]))
+                    print("Could not add {}={} to the metadata; not recognized".format(newMeta, newMetaDict[newMeta]))
         
         data = {"meta":json.dumps(existingMeta)}
         
@@ -650,33 +698,34 @@ def changeSessionMetadata(session_ids,newMetaDict):
         resultTags = [res['tag'] for res in trial['results']]
         
         metaPath = os.path.join(os.getcwd(),'sessionMetadata.yaml')
-        yamlURL = trial['results'][resultTags.index('session_metadata')]['media']
-        download_file(yamlURL,metaPath)
-        
-        metaYaml = importMetadata(metaPath)
-        
-        addedKey= {}
-        for key in metaYaml.keys():
-            if key in newMetaDict.keys():
-                metaYaml[key] = newMetaDict[key]
-                addedKey[key] = newMetaDict[key]
-            if type(metaYaml[key]) is dict:
-                for key2 in metaYaml[key].keys():
-                    if key2 in newMetaDict.keys():
-                        metaYaml[key][key2] = newMetaDict[key2] 
-                        addedKey[key2] = newMetaDict[key2]
-                        
-        for newMeta in newMetaDict:
-            if not newMeta in addedKey:
-               print("Could not find {} in existing yaml, adding it.".format(newMeta))               
-               metaYaml[newMeta] = newMetaDict[newMeta]
-                        
-        with open(metaPath, 'w') as file:
-            yaml.dump(metaYaml, file)
+        if 'session_metadata' in resultTags:
+            yamlURL = trial['results'][resultTags.index('session_metadata')]['media']
+            download_file(yamlURL,metaPath)
             
-        deleteResult(trial_id, tag='session_metadata')
-        postFileToTrial(metaPath,trial_id,tag='session_metadata',device_id='all')
-        os.remove(metaPath)
+            metaYaml = importMetadata(metaPath)
+            
+            addedKey= {}
+            for key in metaYaml.keys():
+                if key in newMetaDict.keys():
+                    metaYaml[key] = newMetaDict[key]
+                    addedKey[key] = newMetaDict[key]
+                if type(metaYaml[key]) is dict:
+                    for key2 in metaYaml[key].keys():
+                        if key2 in newMetaDict.keys():
+                            metaYaml[key][key2] = newMetaDict[key2] 
+                            addedKey[key2] = newMetaDict[key2]
+                            
+            for newMeta in newMetaDict:
+                if not newMeta in addedKey:
+                    print("Could not find {} in existing yaml, adding it.".format(newMeta))               
+                    metaYaml[newMeta] = newMetaDict[newMeta]
+                            
+            with open(metaPath, 'w') as file:
+                yaml.dump(metaYaml, file)
+                
+            deleteResult(trial_id, tag='session_metadata')
+            postFileToTrial(metaPath,trial_id,tag='session_metadata',device_id='all')
+            os.remove(metaPath)
         
 def makeSessionPublic(session_id,publicStatus=True):
     
@@ -724,9 +773,11 @@ def postMotionData(trial_id,session_path,trial_name=None,isNeutral=False,
     camDirs = glob.glob(os.path.join(session_path,'Videos','Cam*'))
     for camDir in camDirs:
         outputPklFolder = os.path.join(camDir,pklDir)
-        pklPath = glob.glob(os.path.join(outputPklFolder,'*_pp.pkl'))[0]
-        _,camName = os.path.split(camDir)
-        postFileToTrial(pklPath,trial_id,tag='pose_pickle',device_id=camName)
+        pickle_files = glob.glob(os.path.join(outputPklFolder,'*_pp.pkl'))
+        if pickle_files:
+            pklPath = pickle_files[0]
+            _,camName = os.path.split(camDir)
+            postFileToTrial(pklPath,trial_id,tag='pose_pickle',device_id=camName)
         
     # post marker data
     deleteResult(trial_id, tag='marker_data')
@@ -758,7 +809,7 @@ def getMotionData(trial_id,session_path,simplePath=False):
     resultTags = [res['tag'] for res in trial['results']]
 
     # get marker data
-    if 'ik_results' in resultTags:
+    if 'marker_data' in resultTags:
         markerFolder = os.path.join(session_path,'MarkerData','PostAugmentation',trial_name)
         if simplePath:
             markerFolder = os.path.join(session_path,'MarkerData')
@@ -1421,7 +1472,21 @@ def getVideoExtension(pathFileWithoutExtension):
 # check how much time has passed since last status check
 def checkTime(t,minutesElapsed=30):
     t2 = time.localtime()
-    return (t2.tm_hour - t.tm_hour) * 60 + (t2.tm_min - t.tm_min) >= minutesElapsed
+    return (t2.tm_hour - t.tm_hour) * 3600 + (t2.tm_min - t.tm_min)*60 + (t2.tm_sec - t.tm_sec) >= minutesElapsed*60
+
+# check for trials with certain status
+def checkForTrialsWithStatus(status,hours=9999999,relativeTime='newer'):
+    
+    # get trials with statusOld
+    params = {'status':status,
+              'hoursSinceUpdate':hours,
+              'justNumber':1,
+              'relativeTime':relativeTime}
+    
+    r = requests.get(API_URL+"trials/get_trials_with_status/",params=params,
+        headers = {"Authorization": "Token {}".format(API_TOKEN)}).json()
+    
+    return r['nTrials']
 
 # send status email
 def sendStatusEmail(message=None,subject=None):
@@ -1432,6 +1497,10 @@ def sendStatusEmail(message=None,subject=None):
     emailInfo = getStatusEmails()
     if emailInfo is None:
         return('No email info or wrong email info in env file.')
+    
+    if 'ip' in emailInfo:
+        ip = emailInfo['ip']
+        message = message + ' IP: ' + ip
        
     if message is None:
         message = "A backend server is down and has been stopped."
@@ -1471,8 +1540,7 @@ def checkResourceUsage(stop_machine_and_email=True):
     
     if stop_machine_and_email and resourceUsage['disk_perc'] > 95:
             
-        message = "Disc is full on an OpenCap machine backend machine: " \
-                            + socket.gethostname() + ". It has been stopped. Data: " \
+        message = "Disc is full on an OpenCap backend machine. It has been stopped. Data: " \
                             + json.dumps(resourceUsage)
         sendStatusEmail(message=message)
         
@@ -1489,8 +1557,7 @@ def checkCudaTF():
         for gpu in gpus:
             print(f"GPU: {gpu.name}")
     else:
-        message = "Cuda check failed on an OpenCap machine backend machine: " \
-                            + socket.gethostname() + ". It has been stopped."
+        message = "Cuda check failed on an OpenCap backend machine. It has been stopped."
         sendStatusEmail(message=message)
         raise Exception("No GPU detected. Exiting.")
 
@@ -1549,3 +1616,41 @@ def get_entry_with_largest_number(trialList):
             continue
 
     return max_entry
+
+# Get local client info and update
+
+def getCommitHash():
+    """Get the git commit hash stored in the environment variable
+    GIT_COMMIT_HASH. This is assumed to be set in the Docker build
+    step. If not set, returns Null (default value for os.getenv())
+    """
+    return os.getenv('GIT_COMMIT_HASH')
+
+def getHostname():
+    """Get the hostname. For a docker container, this is the container ID."""
+    return socket.gethostname()
+
+def postLocalClientInfo(trial_url):
+    """Given a trial_url, updates the Trial fields for 
+    'git_commit' and 'hostname'.
+    """
+    data = {
+            "git_commit": getCommitHash(),
+            "hostname": getHostname()
+        }
+    r = requests.patch(trial_url, data=data,
+          headers = {"Authorization": "Token {}".format(API_TOKEN)})
+    
+    return r
+
+def postProcessedDuration(trial_url, duration):
+    """Given a trial_url and duration (formed from difference in datetime
+    objects), updates the Trial field for 'processed_duration'.
+    """
+    data = {
+        "processed_duration": duration
+    }
+    r = requests.patch(trial_url, data=data,
+            headers = {"Authorization": "Token {}".format(API_TOKEN)})
+    
+    return r
